@@ -1,51 +1,93 @@
 module ConstructorTests
 
-open Nethereum.Web3
 open FsUnit.Xunit
 open Xunit
-open Microsoft.FSharp.Control
-open FSharp.Data
-open System
 open Nethereum.RPC.Eth.DTOs
+open Nethereum.Contracts
+open TestBase
 open System.Numerics
-open Nethereum.Hex.HexTypes
 
-type ABIType = JsonProvider<"../build/contracts/BucketSale.json">
 
-let account = Accounts.Account("67b3534fb704a30cdb8c541b61becd5683662942a1b308e81822faf43c5d58ac")
-
-let abi = ABIType.Load("../../../../build/contracts/BucketSale.json")
-
-let minute = 60
-let hour = minute * 60
-let day = hour * 24
-let startOfSale = DateTimeOffset(DateTime.Now.AddDays(-1.0)).ToUnixTimeSeconds
-let bucketPeriod = 7 * hour
-let bucketSupply = 50000
-let zeroAddress = "0x0000000000000000000000000000000000000000"
-
-let shouldSucceed (txr: TransactionReceipt) = txr.Status |> should equal "0x1"
-let hexBigInteger (value: uint64) = HexBigInteger(BigInteger(value))
-let maxGas = hexBigInteger 4000000UL
-
-[<Fact>]
-let ``Can construct the contract``() =
-    let w3 = Web3(account, "http://localhost:8545")
-
-    let accounts =
-        w3.Eth.Accounts.SendRequestAsync()
-        |> Async.AwaitTask
-        |> Async.RunSynchronously
-
-    accounts.Length |> should equal 10
-
-    let constructorParams: obj list =
-        [ account.Address; startOfSale; bucketPeriod; bucketSupply; zeroAddress; zeroAddress ]
+let DAI =
+    let abi = Abi("../../../../build/contracts/TestToken.json")
 
     let deployTxReceipt =
-        w3.Eth.DeployContract.SendRequestAndWaitForReceiptAsync
-            (abi.Bytecode, account.Address, maxGas, constructorParams)
-        |> Async.AwaitTask
-        |> Async.RunSynchronously
+        ethConn.DeployContractAsync abi
+            [| "MCD DAI stable coin"
+               "DAI"
+               ethConn.Account.Address
+               BigInteger(1000000UL) |]
+        |> runNow
+
+    let result = ContractPlug(ethConn, abi, deployTxReceipt.ContractAddress)
+    result.QueryFunction "balanceOf" [| ethConn.Account.Address |]
+    |> should equal (BigInteger(1000000UL) * BigInteger(1000000000000000000UL))
+    result
+
+let FRY =
+    let abi = Abi("../../../../build/contracts/TestToken.json")
+
+    let deployTxReceipt =
+        ethConn.DeployContractAsync abi
+            [| "Foundry logistics token"
+               "FRY"
+               ethConn.Account.Address
+               BigInteger(1000000UL) |]
+        |> runNow
+
+    let result = ContractPlug(ethConn, abi, deployTxReceipt.ContractAddress)
+    result
+
+let bucketSale =
+    let abi = Abi("../../../../build/contracts/BucketSale.json")
+    let deployTxReceipt =
+        ethConn.DeployContractAsync abi
+            [| ethConn.Account.Address; startOfSale; bucketPeriod; bucketSupply; bucketCount; DAI.Address; FRY.Address |]
+        |> runNow
+    ContractPlug(ethConn, abi, deployTxReceipt.ContractAddress)
+
+[<Specification("BucketSale", "misc", 0)>]
+[<Fact>]
+let ``Can send eth``() =
+    let balance = ethConn.Web3.Eth.GetBalance.SendRequestAsync(ethConn.Account.Address) |> runNow
+    balance.Value |> should greaterThan (bigInt 0UL)
+
+    let transactionInput =
+        TransactionInput
+            ("", zeroAddress, ethConn.Account.Address, hexBigInt 4000000UL, hexBigInt 1000000000UL, hexBigInt 1UL)
+
+    let sendEthTxReceipt =
+        ethConn.Web3.Eth.TransactionManager.SendTransactionAndWaitForReceiptAsync(transactionInput, null) |> runNow
+
+    sendEthTxReceipt |> shouldSucceed
+
+    let balanceAfter = ethConn.Web3.Eth.GetBalance.SendRequestAsync(zeroAddress) |> runNow
+    balanceAfter.Value |> should greaterThan (bigInt 1UL)
+
+[<Specification("BucketSale", "constructor", 1)>]
+[<Fact>]
+let ``Can construct the contract``() =
+    let abi = Abi("../../../../build/contracts/BucketSale.json")
+    let deployTxReceipt =
+        ethConn.DeployContractAsync abi
+            [| ethConn.Account.Address; startOfSale; bucketPeriod; bucketSupply; bucketCount; zeroAddress; zeroAddress |]
+        |> runNow
 
     deployTxReceipt |> shouldSucceed
+
+    // Assert
+    let contract = ContractPlug(ethConn, abi, deployTxReceipt.ContractAddress)
+
+    contract.QueryFunction "owner" [||] |> shouldEqualIgnoringCase ethConn.Account.Address
+    contract.QueryFunction "startOfSale" [||] |> should equal startOfSale
+    contract.QueryFunction "bucketPeriod" [||] |> should equal bucketPeriod
+    contract.QueryFunction "bucketSupply" [||] |> should equal bucketSupply
+    contract.QueryFunction "bucketCount" [||] |> should equal bucketCount
+    contract.QueryFunction "tokenOnSale" [||] |> shouldEqualIgnoringCase tokenOnSale
+    contract.QueryFunction "tokenSoldFor" [||] |> shouldEqualIgnoringCase tokenSoldFor
+
+[<Fact>]
+let ``Cannot enter bucket sale with 0 amount``() =
+    let data = bucketSale.FunctionData "enter" [| ethConn.Account.Address; 0; 0UL; zeroAddress |]
+    let receipt = ethConn.SendTxAsync bucketSale.Address data (BigInteger(0)) |> runNow
+    receipt |> shouldFail
